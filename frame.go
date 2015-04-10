@@ -386,6 +386,8 @@ func (f *framer) parseFrame() (frame, error) {
 		frame = f.parseAuthChallengeFrame()
 	case opAuthSuccess:
 		frame = f.parseAuthSuccessFrame()
+	case opEvent:
+		frame, err = f.parseEventFrame()
 	default:
 		return nil, NewErrProtocol("unknown op in frame header: %s", f.header.op)
 	}
@@ -901,6 +903,102 @@ func (f *framer) parseAuthChallengeFrame() frame {
 	}
 }
 
+type topologyChangeEvent struct {
+	frameHeader
+
+	changeType string
+	addr       net.IP
+	port       int
+}
+
+func (s *topologyChangeEvent) String() string {
+	return fmt.Sprintf("[topology_change_event type=%q addr=%v port=%d]", s.changeType, s.addr, s.port)
+}
+
+type statusChageEvent struct {
+	frameHeader
+
+	changeType string
+	addr       net.IP
+	port       int
+}
+
+func (s *statusChageEvent) String() string {
+	return fmt.Sprintf("[status_chage_event type=%q addr=%v port=%d]", s.changeType, s.addr, s.port)
+}
+
+type schemaChangeEvent struct {
+	frameHeader
+
+	changeType string
+	target     string
+	keyspace   string
+	// only if target != "KEYSPACE"
+	object string
+}
+
+func (s *schemaChangeEvent) String() string {
+	return fmt.Sprintf("[schema_change_event type=%q target=%q keyspace=%q object=%q]", s.changeType, s.target, s.keyspace, s.object)
+}
+
+func (f *framer) parseEventFrame() (frame, error) {
+	eventType := f.readString()
+
+	switch eventType {
+	case "TOPOLOGY_CHANGE":
+		changeType := f.readString()
+		addr, port := f.readInet()
+
+		return &topologyChangeEvent{
+			frameHeader: *f.header,
+			changeType:  changeType,
+			addr:        addr,
+			port:        port,
+		}, nil
+	case "STATUS_CHANGE":
+		changeType := f.readString()
+		addr, port := f.readInet()
+
+		return &statusChageEvent{
+			frameHeader: *f.header,
+			changeType:  changeType,
+			addr:        addr,
+			port:        port,
+		}, nil
+	case "SCHEMA_CHANGE":
+		changeType := f.readString()
+
+		frame := &schemaChangeEvent{
+			frameHeader: *f.header,
+			changeType:  changeType,
+		}
+
+		if f.proto >= protoVersion3 {
+			frame.target = f.readString()
+			switch frame.target {
+			case "KEYSPACE":
+				frame.keyspace = f.readString()
+			case "TABLE", "TYPE":
+				frame.keyspace = f.readString()
+				frame.object = f.readString()
+			}
+		} else {
+			frame.keyspace = f.readString()
+			frame.object = f.readString()
+			// we emulate v3 api here
+			if frame.object == "" {
+				frame.target = "KEYSPACE"
+			} else {
+				frame.target = "TABLE"
+			}
+		}
+
+		return frame, nil
+	default:
+		return nil, fmt.Errorf("unknown event type: %q", eventType)
+	}
+}
+
 type writeAuthResponseFrame struct {
 	data []byte
 }
@@ -1141,6 +1239,31 @@ func (f *framer) writeBatchFrame(streamID int, w *writeBatchFrame) error {
 		}
 	}
 
+	return f.finishWrite()
+}
+
+type optionsFrame struct{}
+
+func (o *optionsFrame) writeFrame(fr *framer, streamID int) error {
+	return fr.writeOptionsFrame(streamID)
+}
+
+func (f *framer) writeOptionsFrame(streamID int) error {
+	f.writeHeader(0, opOptions, streamID)
+	return f.finishWrite()
+}
+
+type registerFrame struct {
+	events []string
+}
+
+func (r *registerFrame) writeFrame(fr *framer, streamID int) error {
+	return fr.writeRegisterFrame(streamID, r.events)
+}
+
+func (f *framer) writeRegisterFrame(streamID int, events []string) error {
+	f.writeHeader(f.flags, opRegister, streamID)
+	f.writeStringList(events)
 	return f.finishWrite()
 }
 
