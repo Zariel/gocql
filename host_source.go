@@ -3,6 +3,7 @@ package gocql
 import (
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -16,18 +17,19 @@ type HostInfo struct {
 
 // Polls system.peers at a specific interval to find new hosts
 type ringDescriber struct {
-	dcFilter        string
-	rackFilter      string
-	prevHosts       []HostInfo
+	dcFilter   string
+	rackFilter string
+	session    *Session
+	conn       *controlConnection
+
+	mu              sync.Mutex
+	previous        []HostInfo
 	prevPartitioner string
-	session         *Session
 }
 
-func (r *ringDescriber) GetHosts() (
-	hosts []HostInfo,
-	partitioner string,
-	err error,
-) {
+func (r *ringDescriber) GetHosts() (hosts []HostInfo, partitioner string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	// we need conn to be the same because we need to query system.peers and system.local
 	// on the same node to get the whole cluster
 	conn := r.session.Pool.Pick(nil)
