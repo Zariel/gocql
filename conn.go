@@ -355,9 +355,13 @@ func (c *Conn) exec(req frameWriter, tracer Tracer) (frame, error) {
 		return nil, err
 	}
 
-	err = <-call.resp
-	if err != nil {
-		return nil, err
+	select {
+	case err = <-call.resp:
+		if err != nil {
+			return nil, err
+		}
+	case <-time.After(c.timeout):
+		return nil, ErrTimeout
 	}
 
 	if v := framer.header.version.version(); v != c.version {
@@ -709,4 +713,5 @@ type inflightPrepare struct {
 
 var (
 	ErrQueryArgLength = errors.New("query argument length mismatch")
+	ErrTimeout        = errors.New("query timed out waiting for a response from server")
 )

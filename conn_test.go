@@ -166,11 +166,15 @@ func TestSlowQuery(t *testing.T) {
 	srv := NewTestServer(t, defaultProto)
 	defer srv.Stop()
 
-	db, err := newTestSession(srv.Address, defaultProto)
+	cluster := NewCluster(srv.Address, defaultProto)
+	cluster.Timeout = 2 * time.Second
+
+	db, err := cluster.CreateSession()
 	if err != nil {
 		t.Errorf("NewCluster: %v", err)
 		return
 	}
+	defer db.Close()
 
 	if err := db.Query("slow").Exec(); err != nil {
 		t.Fatal(err)
