@@ -73,10 +73,15 @@ type ConnConfig struct {
 	Authenticator Authenticator
 	Keepalive     time.Duration
 	tlsConfig     *tls.Config
+	eventHandler  eventHandler
 }
 
 type ConnErrorHandler interface {
 	HandleError(conn *Conn, err error, closed bool)
+}
+
+type eventHandler interface {
+	handleEvent(framer *framer)
 }
 
 // Conn is a single connection to a Cassandra node. It can be used to execute
@@ -86,6 +91,7 @@ type Conn struct {
 	conn    net.Conn
 	r       *bufio.Reader
 	timeout time.Duration
+	cfg     *ConnConfig
 
 	headerBuf []byte
 
@@ -102,11 +108,13 @@ type Conn struct {
 
 	closedMu sync.RWMutex
 	isClosed bool
+
+	eventHandler eventHandler
 }
 
 // Connect establishes a connection to a Cassandra node.
 // You must also call the Serve method before you can execute any queries.
-func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn, error) {
+func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler) (*Conn, error) {
 	var (
 		err  error
 		conn net.Conn
@@ -148,6 +156,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 
 	c := &Conn{
 		conn:         conn,
+		cfg:          cfg,
 		r:            bufio.NewReader(conn),
 		uniq:         make(chan int, cfg.NumStreams),
 		calls:        make([]callReq, cfg.NumStreams),
@@ -158,6 +167,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 		compressor:   cfg.Compressor,
 		auth:         cfg.Authenticator,
 		headerBuf:    make([]byte, headerSize),
+		eventHandler: cfg.eventHandler,
 	}
 
 	if cfg.Keepalive > 0 {
@@ -171,7 +181,7 @@ func Connect(addr string, cfg ConnConfig, errorHandler ConnErrorHandler) (*Conn,
 
 	go c.serve()
 
-	if err := c.startup(&cfg); err != nil {
+	if err := c.startup(); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -211,9 +221,9 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	return
 }
 
-func (c *Conn) startup(cfg *ConnConfig) error {
+func (c *Conn) startup() error {
 	m := map[string]string{
-		"CQL_VERSION": cfg.CQLVersion,
+		"CQL_VERSION": c.cfg.CQLVersion,
 	}
 
 	if c.compressor != nil {
@@ -324,6 +334,26 @@ func (c *Conn) recv() error {
 	head, err := readHeader(c.r, c.headerBuf)
 	if err != nil {
 		return err
+	}
+
+	if head.stream < 0 {
+		log.Println(head)
+		if head.stream != -1 {
+			return fmt.Errorf("unexpected stream: %v", head)
+		}
+
+		framer := newFramer(c, c, c.compressor, c.version)
+		if err := framer.readFrame(&head); err != nil {
+			return err
+		}
+
+		if c.eventHandler == nil {
+			framerPool.Put(framer)
+			return nil
+		}
+
+		go c.eventHandler.handleEvent(framer)
+		return nil
 	}
 
 	call := &c.calls[head.stream]

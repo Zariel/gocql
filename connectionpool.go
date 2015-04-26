@@ -136,7 +136,8 @@ type SimplePool struct {
 	quitWait chan bool
 	quitOnce sync.Once
 
-	tlsConfig *tls.Config
+	tlsConfig  *tls.Config
+	connConfig *ConnConfig
 }
 
 func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
@@ -171,6 +172,16 @@ func setupTLSConfig(sslOpts *SslOptions) (*tls.Config, error) {
 //NewSimplePool is the function used by gocql to create the simple connection pool.
 //This is the default if no other pool type is specified.
 func NewSimplePool(cfg *ClusterConfig) (ConnectionPool, error) {
+	connConfig := &ConnConfig{
+		ProtoVersion:  cfg.ProtoVersion,
+		CQLVersion:    cfg.CQLVersion,
+		Timeout:       cfg.Timeout,
+		NumStreams:    cfg.NumStreams,
+		Compressor:    cfg.Compressor,
+		Authenticator: cfg.Authenticator,
+		Keepalive:     cfg.SocketKeepalive,
+	}
+
 	pool := &SimplePool{
 		cfg:          cfg,
 		hostPool:     NewRoundRobin(),
@@ -180,6 +191,7 @@ func NewSimplePool(cfg *ClusterConfig) (ConnectionPool, error) {
 		cFillingPool: make(chan int, 1),
 		keyspace:     cfg.Keyspace,
 		hosts:        make(map[string]*HostInfo),
+		connConfig:   connConfig,
 	}
 
 	for _, host := range cfg.Hosts {
@@ -193,7 +205,7 @@ func NewSimplePool(cfg *ClusterConfig) (ConnectionPool, error) {
 		if err != nil {
 			return nil, err
 		}
-		pool.tlsConfig = config
+		pool.connConfig.tlsConfig = config
 	}
 
 	//Walk through connecting to hosts. As soon as one host connects
@@ -212,19 +224,7 @@ func NewSimplePool(cfg *ClusterConfig) (ConnectionPool, error) {
 }
 
 func (c *SimplePool) connect(addr string) error {
-
-	cfg := ConnConfig{
-		ProtoVersion:  c.cfg.ProtoVersion,
-		CQLVersion:    c.cfg.CQLVersion,
-		Timeout:       c.cfg.Timeout,
-		NumStreams:    c.cfg.NumStreams,
-		Compressor:    c.cfg.Compressor,
-		Authenticator: c.cfg.Authenticator,
-		Keepalive:     c.cfg.SocketKeepalive,
-		tlsConfig:     c.tlsConfig,
-	}
-
-	conn, err := Connect(addr, cfg, c)
+	conn, err := Connect(addr, c.connConfig, c)
 	if err != nil {
 		log.Printf("connect: failed to connect to %q: %v", addr, err)
 		return err
@@ -474,7 +474,7 @@ func NewTokenAwareConnPool(cfg *ClusterConfig) (ConnectionPool, error) {
 type policyConnPool struct {
 	port     int
 	numConns int
-	connCfg  ConnConfig
+	connCfg  *ConnConfig
 	keyspace string
 
 	mu            sync.RWMutex
@@ -507,7 +507,7 @@ func NewPolicyConnPool(
 	pool := &policyConnPool{
 		port:     cfg.Port,
 		numConns: cfg.NumConns,
-		connCfg: ConnConfig{
+		connCfg: &ConnConfig{
 			ProtoVersion:  cfg.ProtoVersion,
 			CQLVersion:    cfg.CQLVersion,
 			Timeout:       cfg.Timeout,
@@ -628,7 +628,7 @@ type hostConnPool struct {
 	port     int
 	addr     string
 	size     int
-	connCfg  ConnConfig
+	connCfg  *ConnConfig
 	keyspace string
 	policy   ConnSelectionPolicy
 	// protection for conns, closed, filling
@@ -642,7 +642,7 @@ func newHostConnPool(
 	host string,
 	port int,
 	size int,
-	connCfg ConnConfig,
+	connCfg *ConnConfig,
 	keyspace string,
 	policy ConnSelectionPolicy,
 ) *hostConnPool {

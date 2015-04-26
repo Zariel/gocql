@@ -1,10 +1,8 @@
 package gocql
 
 import (
-	"log"
 	"net"
 	"sync"
-	"time"
 )
 
 type HostInfo struct {
@@ -23,7 +21,7 @@ type ringDescriber struct {
 	conn       *controlConnection
 
 	mu              sync.Mutex
-	previous        []HostInfo
+	prevHosts       []HostInfo
 	prevPartitioner string
 }
 
@@ -92,26 +90,20 @@ func (r *ringDescriber) matchFilter(host *HostInfo) bool {
 	return true
 }
 
-func (h *ringDescriber) run(sleep time.Duration) {
-	if sleep == 0 {
-		sleep = 30 * time.Second
+func (h *ringDescriber) refreshRing() error {
+	// if we have 0 hosts this will return the previous list of hosts to
+	// attempt to reconnect to the cluster otherwise we would never find
+	// downed hosts again, could possibly have an optimisation to only
+	// try to add new hosts if GetHosts didnt error and the hosts didnt change.
+	hosts, partitioner, err := h.GetHosts()
+	if err != nil {
+		return err
 	}
 
-	for {
-		// if we have 0 hosts this will return the previous list of hosts to
-		// attempt to reconnect to the cluster otherwise we would never find
-		// downed hosts again, could possibly have an optimisation to only
-		// try to add new hosts if GetHosts didnt error and the hosts didnt change.
-		hosts, partitioner, err := h.GetHosts()
-		if err != nil {
-			log.Println("RingDescriber: unable to get ring topology:", err)
-		} else {
-			h.session.Pool.SetHosts(hosts)
-			if v, ok := h.session.Pool.(SetPartitioner); ok {
-				v.SetPartitioner(partitioner)
-			}
-		}
-
-		time.Sleep(sleep)
+	h.session.Pool.SetHosts(hosts)
+	if v, ok := h.session.Pool.(SetPartitioner); ok {
+		v.SetPartitioner(partitioner)
 	}
+
+	return nil
 }

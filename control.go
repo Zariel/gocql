@@ -2,7 +2,10 @@ package gocql
 
 import (
 	"errors"
+	"fmt"
 	"log"
+	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -59,24 +62,42 @@ func (c *controlConnection) heartBeat() {
 		}
 
 		c.mu.RLock()
-		if c.conn == nil {
+		if c.conn == nil || c.conn.Closed() {
 			c.mu.RUnlock()
-
 			select {
+			case c.errCh <- errors.New("connection is nil"):
+				continue
 			case <-c.quit:
 				return
-			case c.errCh <- errors.New("nil conn"):
-				continue
 			}
 		}
 
 		// have a select switch to do polling as well? is polling necersarry?
 		// TODO: check if resp is an error frame
-		_, err := c.conn.exec(&optionsFrame{}, nil)
+		resp, err := c.conn.exec(&optionsFrame{}, nil)
 		c.mu.RUnlock()
-		if err == nil {
+		if err != nil {
 			select {
-			case <-time.After(c.heartbeatInterval):
+			case c.errCh <- err:
+				continue
+			case <-c.quit:
+				return
+			}
+		}
+
+		switch f := resp.(type) {
+		case *supportedFrame:
+		case error:
+			select {
+			case <-c.quit:
+				return
+			case c.errCh <- f:
+				continue
+			}
+		default:
+			log.Printf("unexpected response to options frame: %v\n", f)
+			select {
+			case c.errCh <- fmt.Errorf("unexpected response to options frame: %v\n", f):
 				continue
 			case <-c.quit:
 				return
@@ -84,10 +105,12 @@ func (c *controlConnection) heartBeat() {
 		}
 
 		select {
-		case c.errCh <- err:
+		case <-time.After(c.heartbeatInterval):
+			continue
 		case <-c.quit:
 			return
 		}
+
 	}
 }
 
@@ -113,7 +136,6 @@ func (c *controlConnection) run() {
 }
 
 func (c *controlConnection) reconnect() {
-
 	c.closeMu.RLock()
 	defer c.closeMu.RUnlock()
 
@@ -124,27 +146,33 @@ func (c *controlConnection) reconnect() {
 	c.mu.Lock()
 
 	if c.conn != nil {
+		c.conn = nil
 		c.conn.Close()
 	}
 
 	// TODO: pick another host not a conn
 	// pick another host from the available pool
-	conn := c.session.pool.Pick(nil)
+	conn := c.session.Pool.Pick(nil)
 	if conn == nil {
 		c.mu.Unlock()
 		return
 	}
 	addr := conn.addr
 
-	conn, err := Connect(addr, conn.cfg, c)
+	// copy the config so we dont overwrite the global one
+	cfg := *conn.cfg
+	cfg.eventHandler = c
+
+	conn, err := Connect(addr, &cfg, c)
 	if err != nil {
 		c.mu.Unlock()
 		log.Println(err)
 		return
 	}
 
+	// TODO: add schema change
 	req := &registerFrame{
-		events: []string{"TOPOLOGY_CHANGE", "STATUS_CHANGE", "SCHEMA_CHANGE"},
+		events: []string{"TOPOLOGY_CHANGE", "STATUS_CHANGE"},
 	}
 
 	resp, err := conn.exec(req, nil)
@@ -167,12 +195,9 @@ func (c *controlConnection) reconnect() {
 	c.conn = conn
 	c.mu.Unlock()
 
-	// update the ring topology and schema as it might have changed since last registering
-	c.ring.refreshHosts()
-}
-
-type eventHandler interface {
-	handleEvent(framer *framer)
+	// update the ring topology and schema as it might have changed since last registering,
+	// though we wont see hosts being down.
+	c.ring.refreshRing()
 }
 
 func (c *controlConnection) handleEvent(framer *framer) {
@@ -187,11 +212,29 @@ func (c *controlConnection) handleEvent(framer *framer) {
 
 	switch f := frame.(type) {
 	case *schemaChangeEvent:
-		// c.schemaChange(f)
+		// TODO: handle schema change to update prepared statement cache
 	case *topologyChangeEvent:
-		// c.topologyChange(f)
+		addr := net.JoinHostPort(f.addr.String(), strconv.Itoa(f.port))
+		switch f.changeType {
+		case "NEW_NODE":
+			c.hostAdded(addr)
+		case "REMOVED_NODE":
+			c.hostRemoved(addr)
+		case "MOVED_NODE":
+			c.hostMoved(addr)
+		default:
+			log.Printf("unknown topology change type: %q", f.changeType)
+		}
 	case *statusChageEvent:
-		// c.statusChange(f)
+		addr := net.JoinHostPort(f.addr.String(), strconv.Itoa(f.port))
+		switch f.changeType {
+		case "UP":
+			c.hostUp(addr)
+		case "DOWN":
+			c.hostDown(addr)
+		default:
+			log.Printf("unknown status change type: %q", f.changeType)
+		}
 	case error:
 		// also very bad!
 	default:
@@ -207,13 +250,22 @@ func (c *controlConnection) HandleError(conn *Conn, err error, closed bool) {
 	c.hostDown(conn.addr)
 }
 
+func (c *controlConnection) hostMoved(addr string) {
+	if c.Closed() {
+		return
+	}
+
+	// TODO: how to handle this? For now just update the ring
+	c.ring.refreshRing()
+}
+
 func (c *controlConnection) hostAdded(addr string) {
 	if c.Closed() {
 		return
 	}
 
 	// TODO: only add this node
-	c.ring.refreshHosts()
+	c.session.hostAdded(addr)
 }
 
 func (c *controlConnection) hostRemoved(addr string) {
@@ -221,8 +273,7 @@ func (c *controlConnection) hostRemoved(addr string) {
 		return
 	}
 
-	// TODO: implement this differently
-	c.hostDown(addr)
+	c.session.hostRemoved(addr)
 }
 
 func (c *controlConnection) hostUp(addr string) {
@@ -230,13 +281,15 @@ func (c *controlConnection) hostUp(addr string) {
 		return
 	}
 
-	c.ring.refreshHosts()
+	c.session.hostUp(addr)
 }
 
 func (c *controlConnection) hostDown(addr string) {
 	if c.Closed() {
 		return
 	}
+
+	c.session.hostDown(addr)
 
 	// TODO: ensure that they both have the same format, ip:port
 	c.mu.Lock()
@@ -247,7 +300,6 @@ func (c *controlConnection) hostDown(addr string) {
 
 	if c.conn.addr != addr {
 		c.mu.Unlock()
-		c.ring.refreshHosts()
 		return
 	}
 

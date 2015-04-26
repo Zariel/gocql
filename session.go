@@ -37,7 +37,8 @@ type Session struct {
 	trace               Tracer
 	mu                  sync.RWMutex
 
-	cfg ClusterConfig
+	control *controlConnection
+	cfg     ClusterConfig
 
 	closeMu  sync.RWMutex
 	isClosed bool
@@ -76,29 +77,21 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		cfg:      cfg,
 	}
 
-	//See if there are any connections in the pool
-	if pool.Size() > 0 {
-		s.routingKeyInfoCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
-
-		s.SetConsistency(cfg.Consistency)
-		s.SetPageSize(cfg.PageSize)
-
-		if cfg.DiscoverHosts {
-			hostSource := &ringDescriber{
-				session:    s,
-				dcFilter:   cfg.Discovery.DcFilter,
-				rackFilter: cfg.Discovery.RackFilter,
-			}
-
-			go hostSource.run(cfg.Discovery.Sleep)
-		}
-
-		return s, nil
+	// See if there are any connections in the pool
+	if pool.Size() == 0 {
+		s.Close()
+		return nil, ErrNoConnectionsStarted
 	}
 
-	s.Close()
+	s.routingKeyInfoCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
 
-	return nil, ErrNoConnectionsStarted
+	s.SetConsistency(cfg.Consistency)
+	s.SetPageSize(cfg.PageSize)
+
+	control := newControlConn(s, 1*time.Minute)
+	s.control = control
+
+	return s, nil
 }
 
 // SetConsistency sets the default consistency level for this session. This
@@ -407,6 +400,23 @@ func (s *Session) ExecuteBatch(batch *Batch) error {
 	}
 
 	return err
+}
+
+// handle server events from the control connection
+func (s *Session) hostAdded(addr string) {
+	panic(addr)
+}
+
+func (s *Session) hostRemoved(addr string) {
+	panic(addr)
+}
+
+func (s *Session) hostUp(addr string) {
+	panic(addr)
+}
+
+func (s *Session) hostDown(addr string) {
+	panic(addr)
 }
 
 // Query represents a CQL statement that can be executed.
