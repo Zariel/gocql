@@ -146,6 +146,8 @@ type Conn struct {
 	timeouts int64
 }
 
+var createConn func(addr string) (net.Conn, error)
+
 // Connect establishes a connection to a Cassandra node.
 func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler, session *Session) (*Conn, error) {
 	var (
@@ -153,16 +155,16 @@ func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler, sessio
 		conn net.Conn
 	)
 
-	dialer := &net.Dialer{
-		Timeout: cfg.Timeout,
-	}
-
-	if cfg.tlsConfig != nil {
-		// the TLS config is safe to be reused by connections but it must not
-		// be modified after being used.
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, cfg.tlsConfig)
+	if createConn == nil {
+		if cfg.tlsConfig != nil {
+			// the TLS config is safe to be reused by connections but it must not
+			// be modified after being used.
+			conn, err = tls.DialWithDialer(&session.dialer, "tcp", addr, cfg.tlsConfig)
+		} else {
+			conn, err = session.dialer.Dial("tcp", addr)
+		}
 	} else {
-		conn, err = dialer.Dial("tcp", addr)
+		conn, err = createConn(addr)
 	}
 
 	if err != nil {
@@ -201,10 +203,12 @@ func Connect(addr string, cfg *ConnConfig, errorHandler ConnErrorHandler, sessio
 		c.setKeepalive(cfg.Keepalive)
 	}
 
+	// TODO(zariel): maybe here instead call startup in a goroutine then call
+	// recv in sync then close if error or start serve loop
 	go c.serve()
 
 	if err := c.startup(); err != nil {
-		conn.Close()
+		c.Close()
 		return nil, err
 	}
 	c.started = true

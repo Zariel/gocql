@@ -41,6 +41,7 @@ type Session struct {
 	ring                ring
 
 	connCfg *ConnConfig
+	dialer  net.Dialer
 
 	mu sync.RWMutex
 
@@ -95,6 +96,10 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		prefetch: 0.25,
 		cfg:      cfg,
 		pageSize: cfg.PageSize,
+		dialer: net.Dialer{
+			Timeout:   cfg.Timeout,
+			KeepAlive: cfg.SocketKeepalive,
+		},
 	}
 
 	connCfg, err := connConfig(s)
