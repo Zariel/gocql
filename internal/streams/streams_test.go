@@ -3,6 +3,7 @@ package streams
 import (
 	"math"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -197,5 +198,34 @@ func TestStreamFromBucket(t *testing.T) {
 		if stream := streamFromBucket(test.bucket, test.pos); stream != test.stream {
 			t.Errorf("bucket=%d pos=%d expected %v got %v", test.bucket, test.pos, test.stream, stream)
 		}
+	}
+}
+
+func TestStreamUsed(t *testing.T) {
+	var pattern uint64 = 0xFFFFFFEFFFFFFFFF
+	streams := New(2)
+	streams.streams[0] = pattern
+	streams.streams[1] = math.MaxUint64
+
+	var stopped uint64
+	defer atomic.StoreUint64(&stopped, 1)
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	// Test that we are able to acquire a stream whilst hammering the bucket so that
+	// the cas often fails.
+	go func() {
+		wg.Done()
+
+		for atomic.LoadUint64(&stopped) != 1 {
+			atomic.StoreUint64(&streams.streams[0], pattern)
+			pattern++
+		}
+	}()
+
+	wg.Wait()
+	_, ok := streams.GetStream()
+	if !ok {
+		t.Fatal("unable to get stream even though one is free")
 	}
 }
