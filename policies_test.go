@@ -104,7 +104,7 @@ func TestHostPolicy_TokenAware_SimpleStrategy(t *testing.T) {
 	}, policyInternal.getMetadataReadOnly().replicas)
 
 	// now the token ring is configured
-	query.RoutingKey([]byte("20"))
+	query.WithRoutingKey([]byte("20"))
 	iter = policy.Pick(query)
 	iterCheck(t, iter, "1")
 	iterCheck(t, iter, "2")
@@ -197,7 +197,7 @@ func TestHostPolicy_TokenAware_NilHostInfo(t *testing.T) {
 
 	query := &Query{}
 	query.getKeyspace = func() string { return "myKeyspace" }
-	query.RoutingKey([]byte("20"))
+	query.WithRoutingKey([]byte("20"))
 
 	iter := policy.Pick(query)
 	next := iter()
@@ -472,7 +472,7 @@ func TestHostPolicy_TokenAware(t *testing.T) {
 		t.Fatal("expected to get host from fallback got nil")
 	}
 
-	query.RoutingKey([]byte("30"))
+	query.WithRoutingKey([]byte("30"))
 	if actual := policy.Pick(query)(); actual == nil {
 		t.Fatal("expected to get host from fallback got nil")
 	}
@@ -516,7 +516,7 @@ func TestHostPolicy_TokenAware(t *testing.T) {
 	}, policyInternal.getMetadataReadOnly().replicas)
 
 	// now the token ring is configured
-	query.RoutingKey([]byte("23"))
+	query.WithRoutingKey([]byte("23"))
 	iter = policy.Pick(query)
 	// first should be host with matching token from the local DC
 	iterCheck(t, iter, "4")
@@ -605,7 +605,7 @@ func TestHostPolicy_TokenAware_NetworkStrategy(t *testing.T) {
 	}, policyInternal.getMetadataReadOnly().replicas)
 
 	// now the token ring is configured
-	query.RoutingKey([]byte("18"))
+	query.WithRoutingKey([]byte("18"))
 	iter = policy.Pick(query)
 	// first should be hosts with matching token from the local DC
 	iterCheck(t, iter, "4")

@@ -106,7 +106,7 @@ func TestTracing(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	trace := &traceWriter{session: session, w: buf}
-	if err := session.Query(`INSERT INTO trace (id) VALUES (?)`, 42).Trace(trace).Exec(); err != nil {
+	if err := session.Query(`INSERT INTO trace (id) VALUES (?)`, 42).WithTrace(trace).Exec(); err != nil {
 		t.Fatal("insert:", err)
 	} else if buf.Len() == 0 {
 		t.Fatal("insert: failed to obtain any tracing")
@@ -116,7 +116,7 @@ func TestTracing(t *testing.T) {
 	trace.mu.Unlock()
 
 	var value int
-	if err := session.Query(`SELECT id FROM trace WHERE id = ?`, 42).Trace(trace).Scan(&value); err != nil {
+	if err := session.Query(`SELECT id FROM trace WHERE id = ?`, 42).WithTrace(trace).Scan(&value); err != nil {
 		t.Fatal("select:", err)
 	} else if value != 42 {
 		t.Fatalf("value: expected %d, got %d", 42, value)
@@ -135,6 +135,12 @@ func TestTracing(t *testing.T) {
 	if buf.Len() == 0 {
 		t.Fatal("select: failed to obtain any tracing")
 	}
+}
+
+type queryObserverFunc func(context.Context, ObservedQuery)
+
+func (f queryObserverFunc) ObserveQuery(ctx context.Context, o ObservedQuery) {
+	f(ctx, o)
 }
 
 func TestObserve(t *testing.T) {
@@ -159,7 +165,7 @@ func TestObserve(t *testing.T) {
 		observedStmt = ""
 	}
 
-	observer := funcQueryObserver(func(ctx context.Context, o ObservedQuery) {
+	observer := queryObserverFunc(func(ctx context.Context, o ObservedQuery) {
 		observedKeyspace = o.Keyspace
 		observedStmt = o.Statement
 		observedErr = o.Err
@@ -168,7 +174,7 @@ func TestObserve(t *testing.T) {
 	// select before inserted, will error but the reporting is err=nil as the query is valid
 	resetObserved()
 	var value int
-	if err := session.Query(`SELECT id FROM observe WHERE id = ?`, 43).Observer(observer).Scan(&value); err == nil {
+	if err := session.Query(`SELECT id FROM observe WHERE id = ?`, 43).WithObserver(observer).Scan(&value); err == nil {
 		t.Fatal("select: expected error")
 	} else if observedErr != nil {
 		t.Fatalf("select: observed error expected nil, got %q", observedErr)
@@ -179,7 +185,7 @@ func TestObserve(t *testing.T) {
 	}
 
 	resetObserved()
-	if err := session.Query(`INSERT INTO observe (id) VALUES (?)`, 42).Observer(observer).Exec(); err != nil {
+	if err := session.Query(`INSERT INTO observe (id) VALUES (?)`, 42).WithObserver(observer).Exec(); err != nil {
 		t.Fatal("insert:", err)
 	} else if observedErr != nil {
 		t.Fatal("insert:", observedErr)
@@ -191,7 +197,7 @@ func TestObserve(t *testing.T) {
 
 	resetObserved()
 	value = 0
-	if err := session.Query(`SELECT id FROM observe WHERE id = ?`, 42).Observer(observer).Scan(&value); err != nil {
+	if err := session.Query(`SELECT id FROM observe WHERE id = ?`, 42).WithObserver(observer).Scan(&value); err != nil {
 		t.Fatal("select:", err)
 	} else if value != 42 {
 		t.Fatalf("value: expected %d, got %d", 42, value)
@@ -219,7 +225,7 @@ func TestObserve(t *testing.T) {
 	// reports errors when the query is poorly formed
 	resetObserved()
 	value = 0
-	if err := session.Query(`SELECT id FROM unknown_table WHERE id = ?`, 42).Observer(observer).Scan(&value); err == nil {
+	if err := session.Query(`SELECT id FROM unknown_table WHERE id = ?`, 42).WithObserver(observer).Scan(&value); err == nil {
 		t.Fatal("select: expecting error")
 	} else if observedErr == nil {
 		t.Fatal("select: expecting observed error")
@@ -244,7 +250,7 @@ func TestObserve_Pagination(t *testing.T) {
 		observedRows = -1
 	}
 
-	observer := funcQueryObserver(func(ctx context.Context, o ObservedQuery) {
+	observer := queryObserverFunc(func(ctx context.Context, o ObservedQuery) {
 		observedRows = o.Rows
 	})
 
@@ -258,9 +264,10 @@ func TestObserve_Pagination(t *testing.T) {
 	resetObserved()
 
 	// read the 100 entries in paginated entries of size 10. Expecting 5 observations, each with 10 rows
-	scanner := session.Query(`SELECT id FROM observe2 LIMIT 100`).
-		Observer(observer).
-		PageSize(10).
+	scanner := session.Query(`SELECT id FROM observe2 LIMIT 100`).WithObserver(
+		observer).WithPageSize(
+
+		10).
 		Iter().Scanner()
 	for i := 0; i < 50; i++ {
 		if !scanner.Next() {
@@ -299,7 +306,7 @@ func TestPaging(t *testing.T) {
 		}
 	}
 
-	iter := session.Query("SELECT id FROM paging").PageSize(10).Iter()
+	iter := session.Query("SELECT id FROM paging").WithPageSize(10).Iter()
 	var id int
 	count := 0
 	for iter.Scan(&id) {
@@ -330,7 +337,7 @@ func TestPagingWithBind(t *testing.T) {
 		}
 	}
 
-	q := session.Query("SELECT val FROM paging_bind WHERE id = ? AND val < ?", 1, 50).PageSize(10)
+	q := session.Query("SELECT val FROM paging_bind WHERE id = ? AND val < ?", 1, 50).WithPageSize(10)
 	iter := q.Iter()
 	var id int
 	count := 0
@@ -456,7 +463,7 @@ func TestCAS(t *testing.T) {
 	insertBatch := session.NewBatch(LoggedBatch)
 	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 2c3af400-73a4-11e5-9381-29463d90c3f0, DATEOF(NOW()))")
 	insertBatch.Query("INSERT INTO cas_table (title, revid, last_modified) VALUES ('_foo', 3e4ad2f1-73a4-11e5-9381-29463d90c3f0, DATEOF(NOW()))")
-	if err := session.ExecuteBatch(insertBatch); err != nil {
+	if err := insertBatch.Iter(); err != nil {
 		t.Fatal("insert:", err)
 	}
 
@@ -494,22 +501,22 @@ func TestDurationType(t *testing.T) {
 	}
 
 	durations := []Duration{
-		Duration{
+		{
 			Months:      250,
 			Days:        500,
 			Nanoseconds: 300010001,
 		},
-		Duration{
+		{
 			Months:      -250,
 			Days:        -500,
 			Nanoseconds: -300010001,
 		},
-		Duration{
+		{
 			Months:      0,
 			Days:        128,
 			Nanoseconds: 127,
 		},
-		Duration{
+		{
 			Months:      0x7FFFFFFF,
 			Days:        0x7FFFFFFF,
 			Nanoseconds: 0x7FFFFFFFFFFFFFFF,
@@ -590,7 +597,7 @@ func TestBatch(t *testing.T) {
 		batch.Query(`INSERT INTO batch_table (id) VALUES (?)`, i)
 	}
 
-	if err := session.ExecuteBatch(batch); err != nil {
+	if err := batch.Iter(); err != nil {
 		t.Fatal("execute batch:", err)
 	}
 
@@ -626,7 +633,7 @@ func TestUnpreparedBatch(t *testing.T) {
 		batch.Query(`UPDATE batch_unprepared SET c = c + 1 WHERE id = 1`)
 	}
 
-	if err := session.ExecuteBatch(batch); err != nil {
+	if err := batch.Iter(); err != nil {
 		t.Fatal("execute batch:", err)
 	}
 
@@ -662,7 +669,7 @@ func TestBatchLimit(t *testing.T) {
 	for i := 0; i < 65537; i++ {
 		batch.Query(`INSERT INTO batch_table2 (id) VALUES (?)`, i)
 	}
-	if err := session.ExecuteBatch(batch); err != ErrTooManyStmts {
+	if err := batch.Iter().Close(); err != ErrTooManyStmts {
 		t.Fatal("gocql attempted to execute a batch larger than the support limit of statements.")
 	}
 
@@ -714,7 +721,7 @@ func TestTooManyQueryArgs(t *testing.T) {
 
 	batch := session.NewBatch(UnloggedBatch)
 	batch.Query("INSERT INTO too_many_query_args (id, value) VALUES (?, ?)", 1, 2, 3)
-	err = session.ExecuteBatch(batch)
+	err = batch.Iter().Close()
 
 	if err == nil {
 		t.Fatal("'`INSERT INTO too_many_query_args (id, value) VALUES (?, ?)`, 1, 2, 3' should return an error")
@@ -746,7 +753,7 @@ func TestNotEnoughQueryArgs(t *testing.T) {
 
 	batch := session.NewBatch(UnloggedBatch)
 	batch.Query("INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)", 1, 2)
-	err = session.ExecuteBatch(batch)
+	err = batch.Iter().Close()
 
 	if err == nil {
 		t.Fatal("'`INSERT INTO not_enough_query_args (id, cluster, value) VALUES (?, ?, ?)`, 1, 2' should return an error")
@@ -1320,7 +1327,7 @@ func TestBatchQueryInfo(t *testing.T) {
 	batch := session.NewBatch(LoggedBatch)
 	batch.Bind("INSERT INTO batch_query_info (id, cluster, value) VALUES (?, ?,?)", write)
 
-	if err := session.ExecuteBatch(batch); err != nil {
+	if err := batch.Iter(); err != nil {
 		t.Fatalf("batch insert into batch_query_info failed, err '%v'", err)
 	}
 
@@ -1787,23 +1794,6 @@ func TestVarint(t *testing.T) {
 	}
 }
 
-//TestQueryStats confirms that the stats are returning valid data. Accuracy may be questionable.
-func TestQueryStats(t *testing.T) {
-	session := createSession(t)
-	defer session.Close()
-	qry := session.Query("SELECT * FROM system.peers")
-	if err := qry.Exec(); err != nil {
-		t.Fatalf("query failed. %v", err)
-	} else {
-		if qry.Attempts() < 1 {
-			t.Fatal("expected at least 1 attempt, but got 0")
-		}
-		if qry.Latency() <= 0 {
-			t.Fatalf("expected latency to be greater than 0, but got %v instead.", qry.Latency())
-		}
-	}
-}
-
 // TestIterHosts confirms that host is added to Iter when the query succeeds.
 func TestIterHost(t *testing.T) {
 	session := createSession(t)
@@ -1817,34 +1807,6 @@ func TestIterHost(t *testing.T) {
 }
 
 //TestBatchStats confirms that the stats are returning valid data. Accuracy may be questionable.
-func TestBatchStats(t *testing.T) {
-	session := createSession(t)
-	defer session.Close()
-
-	if session.cfg.ProtoVersion == 1 {
-		t.Skip("atomic batches not supported. Please use Cassandra >= 2.0")
-	}
-
-	if err := createTable(session, "CREATE TABLE gocql_test.batchStats (id int, PRIMARY KEY (id))"); err != nil {
-		t.Fatalf("failed to create table with error '%v'", err)
-	}
-
-	b := session.NewBatch(LoggedBatch)
-	b.Query("INSERT INTO batchStats (id) VALUES (?)", 1)
-	b.Query("INSERT INTO batchStats (id) VALUES (?)", 2)
-
-	if err := session.ExecuteBatch(b); err != nil {
-		t.Fatalf("query failed. %v", err)
-	} else {
-		if b.Attempts() < 1 {
-			t.Fatal("expected at least 1 attempt, but got 0")
-		}
-		if b.Latency() <= 0 {
-			t.Fatalf("expected latency to be greater than 0, but got %v instead.", b.Latency())
-		}
-	}
-}
-
 type funcBatchObserver func(context.Context, ObservedBatch)
 
 func (f funcBatchObserver) ObserveBatch(ctx context.Context, o ObservedBatch) {
@@ -1872,7 +1834,7 @@ func TestBatchObserve(t *testing.T) {
 	var observedBatch *observation
 
 	batch := session.NewBatch(LoggedBatch)
-	batch.Observer(funcBatchObserver(func(ctx context.Context, o ObservedBatch) {
+	batch.WithObserver(funcBatchObserver(func(ctx context.Context, o ObservedBatch) {
 		if observedBatch != nil {
 			t.Fatal("batch observe called more than once")
 		}
@@ -1883,12 +1845,13 @@ func TestBatchObserve(t *testing.T) {
 			observedErr:      o.Err,
 		}
 	}))
+
 	for i := 0; i < 100; i++ {
 		// hard coding 'i' into one of the values for better  testing of observation
 		batch.Query(fmt.Sprintf(`INSERT INTO batch_observe_table (id,other) VALUES (?,%d)`, i), i)
 	}
 
-	if err := session.ExecuteBatch(batch); err != nil {
+	if err := batch.Iter(); err != nil {
 		t.Fatal("execute batch:", err)
 	}
 	if observedBatch == nil {
@@ -2194,45 +2157,6 @@ func TestGetColumnMetadata(t *testing.T) {
 	}
 }
 
-func TestViewMetadata(t *testing.T) {
-	session := createSession(t)
-	defer session.Close()
-	createViews(t, session)
-
-	views, err := getViewsMetadata(session, "gocql_test")
-	if err != nil {
-		t.Fatalf("failed to query view metadata with err: %v", err)
-	}
-	if views == nil {
-		t.Fatal("failed to query view metadata, nil returned")
-	}
-
-	if len(views) != 1 {
-		t.Fatal("expected one view")
-	}
-
-	textType := TypeText
-	if flagCassVersion.Before(3, 0, 0) {
-		textType = TypeVarchar
-	}
-
-	expectedView := ViewMetadata{
-		Keyspace:   "gocql_test",
-		Name:       "basicview",
-		FieldNames: []string{"birthday", "nationality", "weight", "height"},
-		FieldTypes: []TypeInfo{
-			NativeType{typ: TypeTimestamp},
-			NativeType{typ: textType},
-			NativeType{typ: textType},
-			NativeType{typ: textType},
-		},
-	}
-
-	if !reflect.DeepEqual(views[0], expectedView) {
-		t.Fatalf("view is %+v, but expected %+v", views[0], expectedView)
-	}
-}
-
 func TestMaterializedViewMetadata(t *testing.T) {
 	if flagCassVersion.Before(3, 0, 0) {
 		return
@@ -2474,10 +2398,6 @@ func TestKeyspaceMetadata(t *testing.T) {
 		t.Fatalf("expected state function %s, but got %s", "avgstate", aggregate.StateFunc.Name)
 	}
 
-	_, found = keyspaceMetadata.Views["basicview"]
-	if !found {
-		t.Fatal("failed to find the view in metadata")
-	}
 	if flagCassVersion.Major >= 3 {
 		materializedView, found := keyspaceMetadata.MaterializedViews["view_view"]
 		if !found {
@@ -2646,7 +2566,7 @@ func TestTokenAwareConnPool(t *testing.T) {
 		t.Fatalf("failed to insert with err: %v", err)
 	}
 
-	query = session.Query("SELECT data FROM test_token_aware where id = ?", 42).Consistency(One)
+	query = session.Query("SELECT data FROM test_token_aware where id = ?", 42).WithConsistency(One)
 	var data string
 	if err := query.Scan(&data); err != nil {
 		t.Error(err)
@@ -2693,7 +2613,7 @@ func TestManualQueryPaging(t *testing.T) {
 	}
 
 	// disable auto paging, 1 page per iteration
-	query := session.Query("SELECT id, count FROM testManualPaging").PageState(nil).PageSize(2)
+	query := session.Query("SELECT id, count FROM testManualPaging").WithPageState(nil).WithPageSize(2)
 	var id, count, fetched int
 
 	iter := query.Iter()
@@ -2711,7 +2631,7 @@ func TestManualQueryPaging(t *testing.T) {
 
 		if len(iter.PageState()) > 0 {
 			// more pages
-			iter = query.PageState(iter.PageState()).Iter()
+			iter = query.WithPageState(iter.PageState()).Iter()
 		} else {
 			break
 		}
@@ -3133,18 +3053,14 @@ func TestUnsetColBatch(t *testing.T) {
 	b.Query("INSERT INTO gocql_test.batchUnsetInsert(id, my_int, my_text) VALUES (?,?,?)", 1, UnsetValue, "")
 	b.Query("INSERT INTO gocql_test.batchUnsetInsert(id, my_int, my_text) VALUES (?,?,?)", 2, 2, UnsetValue)
 
-	if err := session.ExecuteBatch(b); err != nil {
+	if err := b.Iter(); err != nil {
 		t.Fatalf("query failed. %v", err)
-	} else {
-		if b.Attempts() < 1 {
-			t.Fatal("expected at least 1 attempt, but got 0")
-		}
-		if b.Latency() <= 0 {
-			t.Fatalf("expected latency to be greater than 0, but got %v instead.", b.Latency())
-		}
 	}
-	var id, mInt, count int
-	var mText string
+
+	var (
+		id, mInt, count int
+		mText           string
+	)
 
 	if err := session.Query("SELECT count(*) FROM gocql_test.batchUnsetInsert;").Scan(&count); err != nil {
 		t.Fatalf("Failed to select with err: %v", err)

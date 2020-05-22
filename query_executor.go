@@ -20,8 +20,10 @@ type ExecutableQuery interface {
 }
 
 type queryExecutor struct {
-	pool   *policyConnPool
-	policy HostSelectionPolicy
+	pool        *policyConnPool
+	hosts       HostSelectionPolicy
+	speculation SpeculativeExecutionPolicy
+	retry       RetryPolicy
 }
 
 func (q *queryExecutor) attemptQuery(ctx context.Context, qry ExecutableQuery, conn *Conn) *Iter {
@@ -52,12 +54,11 @@ func (q *queryExecutor) speculate(ctx context.Context, qry ExecutableQuery, sp S
 	return nil
 }
 
-func (q *queryExecutor) executeQuery(qry ExecutableQuery) (*Iter, error) {
+func (q *queryExecutor) executeQuery(qry ExecutableQuery) *Iter {
 	// check if the query is not marked as idempotent, if
 	// it is, we force the policy to NonSpeculative
-	sp := qry.speculativeExecutionPolicy()
-	if !qry.IsIdempotent() || sp.Attempts() == 0 {
-		return q.do(qry.Context(), qry), nil
+	if !qry.IsIdempotent() || (q.speculation != nil && q.speculation.Attempts() == 0) {
+		return q.do(qry.Context(), qry)
 	}
 
 	ctx, cancel := context.WithCancel(qry.Context())
@@ -71,20 +72,20 @@ func (q *queryExecutor) executeQuery(qry ExecutableQuery) (*Iter, error) {
 	// The speculative executions are launched _in addition_ to the main
 	// execution, on a timer. So Speculation{2} would make 3 executions running
 	// in total.
-	if iter := q.speculate(ctx, qry, sp, results); iter != nil {
-		return iter, nil
+	if iter := q.speculate(ctx, qry, q.speculation, results); iter != nil {
+		return iter
 	}
 
 	select {
 	case iter := <-results:
-		return iter, nil
+		return iter
 	case <-ctx.Done():
-		return &Iter{err: ctx.Err()}, nil
+		return &Iter{err: ctx.Err()}
 	}
 }
 
 func (q *queryExecutor) do(ctx context.Context, qry ExecutableQuery) *Iter {
-	hostIter := q.policy.Pick(qry)
+	hostIter := q.hosts.Pick(qry)
 	selectedHost := hostIter()
 	rt := qry.retryPolicy()
 
@@ -124,7 +125,7 @@ func (q *queryExecutor) do(ctx context.Context, qry ExecutableQuery) *Iter {
 
 		// Exit if the query was successful
 		// or no retry policy defined or retry attempts were reached
-		if iter.err == nil || rt == nil || !rt.Attempt(qry) {
+		if iter.err == nil || rt == nil || !rt.Attempt(iter) {
 			return iter
 		}
 		lastErr = iter.err

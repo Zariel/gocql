@@ -129,8 +129,7 @@ func (c *cowHostList) remove(ip net.IP) bool {
 // RetryableQuery is an interface that represents a query or batch statement that
 // exposes the correct functions for the retry policy logic to evaluate correctly.
 type RetryableQuery interface {
-	SetConsistency(c Consistency)
-	GetConsistency() Consistency
+	Consistency() Consistency
 	Context() context.Context
 }
 
@@ -155,7 +154,7 @@ var ErrUnknownRetryType = errors.New("unknown retry type returned by retry polic
 // See SimpleRetryPolicy as an example of implementing and using a RetryPolicy
 // interface.
 type RetryPolicy interface {
-	Attempt(RetryableQuery) bool
+	Attempt(it *Iter) bool
 	GetRetryType(error) RetryType
 }
 
@@ -176,7 +175,7 @@ type SimpleRetryPolicy struct {
 // Attempt tells gocql to attempt the query again based on query.Attempts being less
 // than the NumRetries defined in the policy.
 func (s *SimpleRetryPolicy) Attempt(it *Iter) bool {
-	return it.metrics.attempts() <= s.NumRetries
+	return it.metrics.Attempts() <= s.NumRetries
 }
 
 func (s *SimpleRetryPolicy) GetRetryType(err error) RetryType {
@@ -190,7 +189,7 @@ type ExponentialBackoffRetryPolicy struct {
 }
 
 func (e *ExponentialBackoffRetryPolicy) Attempt(it *Iter) bool {
-	attempts := it.metrics.attempts()
+	attempts := it.metrics.Attempts()
 	if attempts > e.NumRetries {
 		return false
 	}
@@ -240,7 +239,7 @@ type DowngradingConsistencyRetryPolicy struct {
 }
 
 func (d *DowngradingConsistencyRetryPolicy) Attempt(it *Iter) bool {
-	currentAttempt := it.metrics.attempts()
+	currentAttempt := it.metrics.Attempts()
 
 	if currentAttempt > len(d.ConsistencyLevelsToTry) {
 		return false

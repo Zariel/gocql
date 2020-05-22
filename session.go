@@ -146,8 +146,8 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 	s.policy.Init(s)
 
 	s.executor = &queryExecutor{
-		pool:   s.pool,
-		policy: cfg.PoolConfig.HostSelectionPolicy,
+		pool:  s.pool,
+		hosts: cfg.PoolConfig.HostSelectionPolicy,
 	}
 
 	s.queryObserver = cfg.QueryObserver
@@ -368,6 +368,7 @@ func (s *Session) SetTrace(trace Tracer) {
 // value before the query is executed. Query is automatically prepared
 // if it has not previously been executed.
 func (s *Session) Query(stmt string, values ...interface{}) *Query {
+	// TODO: this takes context
 	qry := queryPool.Get().(*Query)
 	qry.session = s
 	qry.stmt = stmt
@@ -437,21 +438,23 @@ func (s *Session) Closed() bool {
 	return closed
 }
 
-func (s *Session) executeQuery(qry *Query) (it *Iter) {
+func (s *Session) executeQuery(q ExecutableQuery) *Iter {
+	// TODO(zariel): pass context in here
+
 	// fail fast
 	if s.Closed() {
 		return &Iter{err: ErrSessionClosed}
 	}
 
-	iter, err := s.executor.executeQuery(qry)
-	if err != nil {
-		return &Iter{err: err}
+	iter := &Iter{
+		executor: &queryExecutor{
+			pool:        s.pool,
+			hosts:       s.policy,
+			retry:       q.retryPolicy(),
+			speculation: q.speculativeExecutionPolicy(),
+		},
 	}
-	if iter == nil {
-		panic("nil iter")
-	}
-
-	return iter
+	return iter.do(q)
 }
 
 func (s *Session) removeHost(h *HostInfo) {
@@ -626,41 +629,14 @@ func (b *Batch) execute(ctx context.Context, conn *Conn) *Iter {
 	return conn.executeBatch(ctx, b)
 }
 
-func (s *Session) executeBatch(batch *Batch) *Iter {
-	// fail fast
-	if s.Closed() {
-		return &Iter{err: ErrSessionClosed}
-	}
-
-	// Prevent the execution of the batch if greater than the limit
-	// Currently batches have a limit of 65536 queries.
-	// https://datastax-oss.atlassian.net/browse/JAVA-229
-	if batch.Size() > BatchSizeMaximum {
-		return &Iter{err: ErrTooManyStmts}
-	}
-
-	iter, err := s.executor.executeQuery(batch)
-	if err != nil {
-		return &Iter{err: err}
-	}
-
-	return iter
-}
-
-// ExecuteBatch executes a batch operation and returns nil if successful
-// otherwise an error is returned describing the failure.
-func (s *Session) ExecuteBatch(batch *Batch) error {
-	iter := s.executeBatch(batch)
-	return iter.Close()
-}
-
 // ExecuteBatchCAS executes a batch operation and returns true if successful and
 // an iterator (to scan aditional rows if more than one conditional statement)
 // was sent.
 // Further scans on the interator must also remember to include
 // the applied boolean as the first argument to *Iter.Scan
 func (s *Session) ExecuteBatchCAS(batch *Batch, dest ...interface{}) (applied bool, iter *Iter, err error) {
-	iter = s.executeBatch(batch)
+	// TODO; merge these with the query variants under ExecuteableQuery they have the same logic
+	iter = s.executeQuery(batch)
 	if err := iter.checkErrAndNotFound(); err != nil {
 		iter.Close()
 		return false, nil, err
@@ -680,7 +656,7 @@ func (s *Session) ExecuteBatchCAS(batch *Batch, dest ...interface{}) (applied bo
 // however it accepts a map rather than a list of arguments for the initial
 // scan.
 func (s *Session) MapExecuteBatchCAS(batch *Batch, dest map[string]interface{}) (applied bool, iter *Iter, err error) {
-	iter = s.executeBatch(batch)
+	iter = s.executeQuery(batch)
 	if err := iter.checkErrAndNotFound(); err != nil {
 		iter.Close()
 		return false, nil, err
@@ -750,14 +726,14 @@ func (qm *queryMetrics) hostMetricsLocked(host *HostInfo) *hostMetrics {
 }
 
 // attempts returns the number of times the query was executed.
-func (qm *queryMetrics) attempts() int {
+func (qm *queryMetrics) Attempts() int {
 	qm.l.Lock()
 	attempts := qm.totalAttempts
 	qm.l.Unlock()
 	return attempts
 }
 
-func (qm *queryMetrics) latency() int64 {
+func (qm *queryMetrics) Latency() int64 {
 	qm.l.Lock()
 	var (
 		attempts int
@@ -857,24 +833,19 @@ func (q Query) String() string {
 // Consistency sets the consistency level for this query. If no consistency
 // level have been set, the default consistency level of the cluster
 // is used.
-func (q *Query) Consistency(c Consistency) *Query {
+func (q *Query) WithConsistency(c Consistency) *Query {
 	q.cons = c
 	return q
 }
 
 // GetConsistency returns the currently configured consistency level for
 // the query.
-func (q *Query) GetConsistency() Consistency {
+func (q *Query) Consistency() Consistency {
 	return q.cons
 }
 
-// Same as Consistency but without a return value
-func (q *Query) SetConsistency(c Consistency) {
-	q.cons = c
-}
-
 // CustomPayload sets the custom payload level for this query.
-func (q *Query) CustomPayload(customPayload map[string][]byte) *Query {
+func (q *Query) WithCustomPayload(customPayload map[string][]byte) *Query {
 	q.customPayload = customPayload
 	return q
 }
@@ -888,14 +859,14 @@ func (q *Query) Context() context.Context {
 
 // Trace enables tracing of this query. Look at the documentation of the
 // Tracer interface to learn more about tracing.
-func (q *Query) Trace(trace Tracer) *Query {
+func (q *Query) WithTrace(trace Tracer) *Query {
 	q.trace = trace
 	return q
 }
 
 // Observer enables query-level observer on this query.
 // The provided observer will be called every time this query is executed.
-func (q *Query) Observer(observer QueryObserver) *Query {
+func (q *Query) WithObserver(observer QueryObserver) *Query {
 	q.observer = observer
 	return q
 }
@@ -904,7 +875,7 @@ func (q *Query) Observer(observer QueryObserver) *Query {
 // This is useful for iterating over large result sets, but setting the
 // page size too low might decrease the performance. This feature is only
 // available in Cassandra 2 and onwards.
-func (q *Query) PageSize(n int) *Query {
+func (q *Query) WithPageSize(n int) *Query {
 	q.pageSize = n
 	return q
 }
@@ -915,7 +886,7 @@ func (q *Query) PageSize(n int) *Query {
 // will still override this timestamp. This is entirely optional.
 //
 // Only available on protocol >= 3
-func (q *Query) DefaultTimestamp(enable bool) *Query {
+func (q *Query) WithDefaultTimestamp(enable bool) *Query {
 	q.defaultTimestamp = enable
 	return q
 }
@@ -927,14 +898,14 @@ func (q *Query) DefaultTimestamp(enable bool) *Query {
 //
 // Only available on protocol >= 3
 func (q *Query) WithTimestamp(timestamp int64) *Query {
-	q.DefaultTimestamp(true)
+	q.WithDefaultTimestamp(true)
 	q.defaultTimestampValue = timestamp
 	return q
 }
 
 // RoutingKey sets the routing key to use when a token aware connection
 // pool is used to optimize the routing of this query.
-func (q *Query) RoutingKey(routingKey []byte) *Query {
+func (q *Query) WithRoutingKey(routingKey []byte) *Query {
 	q.routingKey = routingKey
 	return q
 }
@@ -1043,19 +1014,19 @@ func (q *Query) observe(stats queryExecutionStats) {
 // SetPrefetch sets the default threshold for pre-fetching new pages. If
 // there are only p*pageSize rows remaining, the next page will be requested
 // automatically.
-func (q *Query) Prefetch(p float64) *Query {
+func (q *Query) WithPrefetch(p float64) *Query {
 	q.prefetch = p
 	return q
 }
 
-// RetryPolicy sets the policy to use when retrying the query.
-func (q *Query) RetryPolicy(r RetryPolicy) *Query {
+// WithRetryPolicy sets the policy to use when retrying the query.
+func (q *Query) WithRetryPolicy(r RetryPolicy) *Query {
 	q.rt = r
 	return q
 }
 
-// SetSpeculativeExecutionPolicy sets the execution policy
-func (q *Query) SetSpeculativeExecutionPolicy(sp SpeculativeExecutionPolicy) *Query {
+// WithSpeculativeExecutionPolicy sets the execution policy
+func (q *Query) WithSpeculativeExecutionPolicy(sp SpeculativeExecutionPolicy) *Query {
 	q.spec = sp
 	return q
 }
@@ -1089,7 +1060,7 @@ func (q *Query) Bind(v ...interface{}) *Query {
 // either SERIAL or LOCAL_SERIAL and if not present, it defaults to
 // SERIAL. This option will be ignored for anything else that a
 // conditional update/insert.
-func (q *Query) SerialConsistency(cons SerialConsistency) *Query {
+func (q *Query) WithSerialConsistency(cons SerialConsistency) *Query {
 	q.serialCons = cons
 	return q
 }
@@ -1097,7 +1068,7 @@ func (q *Query) SerialConsistency(cons SerialConsistency) *Query {
 // PageState sets the paging state for the query to resume paging from a specific
 // point in time. Setting this will disable to query paging for this query, and
 // must be used for all subsequent pages.
-func (q *Query) PageState(state []byte) *Query {
+func (q *Query) WithPageState(state []byte) *Query {
 	q.pageState = state
 	q.disableAutoPage = true
 	return q
@@ -1230,12 +1201,29 @@ type Iter struct {
 	next    *nextIter
 	host    *HostInfo
 
-	q       ExecutableQuery
 	metrics queryMetrics
+
+	// move to have an executor per query, stored on the iter. That way it
+	// contains the retry policy, we have the metrics here and instead of just
+	// returning an iter from the execution of a query then having it page
+	// we allocate an iter then execute a query.
+	executor *queryExecutor
 
 	framer *framer
 	closed int32
 }
+
+type queryExecutionCtxt struct {
+	// TODO: seperate executing queries and collecting metrics to returning results.
+	// basically a query can generate [iter]'s and we need to collect them into a single
+	// view for the user and accumulate metrics
+}
+
+func (iter *Iter) do(q ExecutableQuery) {
+
+}
+
+func (iter *Iter) Metrics() *queryMetrics { return &iter.metrics }
 
 type queryExecutionStats struct {
 	start, end time.Time
@@ -1246,7 +1234,7 @@ type queryExecutionStats struct {
 	host       *HostInfo
 }
 
-func (iter *Iter) attempt(end, start time.Time) {
+func (iter *Iter) attempt(q ExecutableQuery, end, start time.Time) {
 	latency := end.Sub(start)
 	attempt, metrics := iter.metrics.attempt(1, latency, iter.host)
 
@@ -1260,7 +1248,7 @@ func (iter *Iter) attempt(end, start time.Time) {
 		attmpt:  attempt,
 	}
 
-	iter.q.observe(stats)
+	q.observe(stats)
 }
 
 // Host returns the host which the query was sent to.
@@ -1305,6 +1293,8 @@ func (is *iterScanner) Next() bool {
 	}
 
 	if iter.pos >= iter.numRows {
+		// TODO: dont launch a new goroutine to do this it can cause a race
+		// and lead to bad perf, have a goroutine in the background prefetching
 		if iter.next != nil {
 			is.iter = iter.next.fetch()
 			return is.Next()
@@ -1331,23 +1321,19 @@ func scanColumn(p []byte, col ColumnInfo, dest []interface{}) (int, error) {
 		return 1, nil
 	}
 
+	count := 1
 	if col.TypeInfo.Type() == TypeTuple {
 		// this will panic, actually a bug, please report
 		tuple := col.TypeInfo.(TupleTypeInfo)
 
-		count := len(tuple.Elems)
-		// here we pass in a slice of the struct which has the number number of
-		// values as elements in the tuple
-		if err := Unmarshal(col.TypeInfo, p, dest[:count]); err != nil {
-			return 0, err
-		}
-		return count, nil
-	} else {
-		if err := Unmarshal(col.TypeInfo, p, dest[0]); err != nil {
-			return 0, err
-		}
-		return 1, nil
+		count = len(tuple.Elems)
 	}
+
+	if err := Unmarshal(col.TypeInfo, p, dest[:count]); err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 func (is *iterScanner) Scan(dest ...interface{}) error {
@@ -1532,9 +1518,9 @@ func (n *nextIter) fetch() *Iter {
 }
 
 type Batch struct {
-	Type                  BatchType
-	Entries               []BatchEntry
-	Cons                  Consistency
+	typ                   BatchType
+	entries               []BatchEntry
+	cons                  Consistency
 	routingKey            []byte
 	routingKeyBuffer      []byte
 	CustomPayload         map[string][]byte
@@ -1551,18 +1537,19 @@ type Batch struct {
 }
 
 // NewBatch creates a new batch operation using defaults defined in the cluster
-func (s *Session) NewBatch(typ BatchType) *Batch {
+func (s *Session) NewBatch(typ BatchType, queries ...BatchEntry) *Batch {
 	s.mu.RLock()
 	batch := &Batch{
-		Type:             typ,
+		typ:              typ,
 		rt:               s.cfg.RetryPolicy,
 		serialCons:       s.cfg.SerialConsistency,
 		observer:         s.batchObserver,
 		session:          s,
-		Cons:             s.cons,
+		cons:             s.cons,
 		defaultTimestamp: s.cfg.DefaultTimestamp,
 		keyspace:         s.cfg.Keyspace,
 		spec:             &NonSpeculativeExecution{},
+		entries:          queries,
 	}
 
 	s.mu.RUnlock()
@@ -1571,7 +1558,7 @@ func (s *Session) NewBatch(typ BatchType) *Batch {
 
 // Observer enables batch-level observer on this batch.
 // The provided observer will be called every time this batched query is executed.
-func (b *Batch) Observer(observer BatchObserver) *Batch {
+func (b *Batch) WithObserver(observer BatchObserver) *Batch {
 	b.observer = observer
 	return b
 }
@@ -1580,16 +1567,16 @@ func (b *Batch) Keyspace() string {
 	return b.keyspace
 }
 
-// GetConsistency returns the currently configured consistency level for the batch
+// Consistency returns the currently configured consistency level for the batch
 // operation.
-func (b *Batch) GetConsistency() Consistency {
-	return b.Cons
+func (b *Batch) Consistency() Consistency {
+	return b.cons
 }
 
 // SetConsistency sets the currently configured consistency level for the batch
 // operation.
-func (b *Batch) SetConsistency(c Consistency) {
-	b.Cons = c
+func (b *Batch) WithConsistency(c Consistency) {
+	b.cons = c
 }
 
 func (b *Batch) Context() context.Context {
@@ -1600,7 +1587,7 @@ func (b *Batch) Context() context.Context {
 }
 
 func (b *Batch) IsIdempotent() bool {
-	for _, entry := range b.Entries {
+	for _, entry := range b.entries {
 		if !entry.Idempotent {
 			return false
 		}
@@ -1612,21 +1599,21 @@ func (b *Batch) speculativeExecutionPolicy() SpeculativeExecutionPolicy {
 	return b.spec
 }
 
-func (b *Batch) SpeculativeExecutionPolicy(sp SpeculativeExecutionPolicy) *Batch {
+func (b *Batch) WithSpeculativeExecutionPolicy(sp SpeculativeExecutionPolicy) *Batch {
 	b.spec = sp
 	return b
 }
 
 // Query adds the query to the batch operation
 func (b *Batch) Query(stmt string, args ...interface{}) {
-	b.Entries = append(b.Entries, BatchEntry{Stmt: stmt, Args: args})
+	b.entries = append(b.entries, BatchEntry{Stmt: stmt, Args: args})
 }
 
 // Bind adds the query to the batch operation and correlates it with a binding callback
 // that will be invoked when the batch is executed. The binding callback allows the application
 // to define which query argument values will be marshalled as part of the batch execution.
 func (b *Batch) Bind(stmt string, bind func(q *QueryInfo) ([]interface{}, error)) {
-	b.Entries = append(b.Entries, BatchEntry{Stmt: stmt, binding: bind})
+	b.entries = append(b.entries, BatchEntry{Stmt: stmt, binding: bind})
 }
 
 func (b *Batch) retryPolicy() RetryPolicy {
@@ -1634,7 +1621,7 @@ func (b *Batch) retryPolicy() RetryPolicy {
 }
 
 // RetryPolicy sets the retry policy to use when executing the batch operation
-func (b *Batch) RetryPolicy(r RetryPolicy) *Batch {
+func (b *Batch) WithRetryPolicy(r RetryPolicy) *Batch {
 	b.rt = r
 	return b
 }
@@ -1657,7 +1644,7 @@ func (b *Batch) WithContext(ctx context.Context) *Batch {
 
 // Size returns the number of batch statements to be executed by the batch operation.
 func (b *Batch) Size() int {
-	return len(b.Entries)
+	return len(b.entries)
 }
 
 // SerialConsistency sets the consistency level for the
@@ -1667,7 +1654,7 @@ func (b *Batch) Size() int {
 // conditional update/insert.
 //
 // Only available for protocol 3 and above
-func (b *Batch) SerialConsistency(cons SerialConsistency) *Batch {
+func (b *Batch) WithSerialConsistency(cons SerialConsistency) *Batch {
 	b.serialCons = cons
 	return b
 }
@@ -1678,7 +1665,7 @@ func (b *Batch) SerialConsistency(cons SerialConsistency) *Batch {
 // will still override this timestamp. This is entirely optional.
 //
 // Only available on protocol >= 3
-func (b *Batch) DefaultTimestamp(enable bool) *Batch {
+func (b *Batch) WithDefaultTimestamp(enable bool) *Batch {
 	b.defaultTimestamp = enable
 	return b
 }
@@ -1690,15 +1677,15 @@ func (b *Batch) DefaultTimestamp(enable bool) *Batch {
 //
 // Only available on protocol >= 3
 func (b *Batch) WithTimestamp(timestamp int64) *Batch {
-	b.DefaultTimestamp(true)
+	b.WithDefaultTimestamp(true)
 	b.defaultTimestampValue = timestamp
 	return b
 }
 
 func (b *Batch) observe(stats queryExecutionStats) {
 	if b.observer != nil {
-		statements := make([]string, len(b.Entries))
-		for i, entry := range b.Entries {
+		statements := make([]string, len(b.entries))
+		for i, entry := range b.entries {
 			statements[i] = entry.Stmt
 		}
 
@@ -1720,11 +1707,11 @@ func (b *Batch) GetRoutingKey() ([]byte, error) {
 		return b.routingKey, nil
 	}
 
-	if len(b.Entries) == 0 {
+	if len(b.entries) == 0 {
 		return nil, nil
 	}
 
-	entry := b.Entries[0]
+	entry := b.entries[0]
 	if entry.binding != nil {
 		// bindings do not have the values let's skip it like Query does.
 		return nil, nil
@@ -1736,6 +1723,10 @@ func (b *Batch) GetRoutingKey() ([]byte, error) {
 	}
 
 	return createRoutingKey(routingKeyInfo, entry.Args)
+}
+
+func (b *Batch) Iter() *Iter {
+	return b.Iter()
 }
 
 func createRoutingKey(routingKeyInfo *routingKeyInfo, values []interface{}) ([]byte, error) {

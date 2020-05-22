@@ -24,7 +24,7 @@ func TestBatch_Errors(t *testing.T) {
 
 	b := session.NewBatch(LoggedBatch)
 	b.Query("SELECT * FROM batch_errors WHERE id=2 AND val=?", nil)
-	if err := session.ExecuteBatch(b); err == nil {
+	if err := b.Iter(); err == nil {
 		t.Fatal("expected to get error for invalid query in batch")
 	}
 }
@@ -46,7 +46,7 @@ func TestBatch_WithTimestamp(t *testing.T) {
 	b := session.NewBatch(LoggedBatch)
 	b.WithTimestamp(micros)
 	b.Query("INSERT INTO batch_ts (id, val) VALUES (?, ?)", 1, "val")
-	if err := session.ExecuteBatch(b); err != nil {
+	if err := b.Iter(); err != nil {
 		t.Fatal(err)
 	}
 

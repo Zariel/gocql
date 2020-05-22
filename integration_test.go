@@ -125,8 +125,8 @@ func TestCustomPayloadMessages(t *testing.T) {
 	}
 
 	// QueryMessage
-	var customPayload = map[string][]byte{"a": []byte{10, 20}, "b": []byte{20, 30}}
-	query := session.Query("SELECT id FROM testCustomPayloadMessages where id = ?", 42).Consistency(One).CustomPayload(customPayload)
+	var customPayload = map[string][]byte{"a": {10, 20}, "b": {20, 30}}
+	query := session.Query("SELECT id FROM testCustomPayloadMessages where id = ?", 42).WithConsistency(One).WithCustomPayload(customPayload)
 	iter := query.Iter()
 	rCustomPayload := iter.GetCustomPayload()
 	if !reflect.DeepEqual(customPayload, rCustomPayload) {
@@ -135,7 +135,7 @@ func TestCustomPayloadMessages(t *testing.T) {
 	iter.Close()
 
 	// Insert query
-	query = session.Query("INSERT INTO testCustomPayloadMessages(id,value) VALUES(1, 1)").Consistency(One).CustomPayload(customPayload)
+	query = session.Query("INSERT INTO testCustomPayloadMessages(id,value) VALUES(1, 1)").WithConsistency(One).WithCustomPayload(customPayload)
 	iter = query.Iter()
 	rCustomPayload = iter.GetCustomPayload()
 	if !reflect.DeepEqual(customPayload, rCustomPayload) {
@@ -147,7 +147,7 @@ func TestCustomPayloadMessages(t *testing.T) {
 	b := session.NewBatch(LoggedBatch)
 	b.CustomPayload = customPayload
 	b.Query("INSERT INTO testCustomPayloadMessages(id,value) VALUES(1, 1)")
-	if err := session.ExecuteBatch(b); err != nil {
+	if err := b.Iter(); err != nil {
 		t.Fatalf("query failed. %v", err)
 	}
 }
@@ -161,10 +161,10 @@ func TestCustomPayloadValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	values := []map[string][]byte{map[string][]byte{"a": []byte{10, 20}, "b": []byte{20, 30}}, nil, map[string][]byte{"a": []byte{10, 20}, "b": nil}}
+	values := []map[string][]byte{{"a": {10, 20}, "b": {20, 30}}, nil, {"a": {10, 20}, "b": nil}}
 
 	for _, customPayload := range values {
-		query := session.Query("SELECT id FROM testCustomPayloadValues where id = ?", 42).Consistency(One).CustomPayload(customPayload)
+		query := session.Query("SELECT id FROM testCustomPayloadValues where id = ?", 42).WithConsistency(One).WithCustomPayload(customPayload)
 		iter := query.Iter()
 		rCustomPayload := iter.GetCustomPayload()
 		if !reflect.DeepEqual(customPayload, rCustomPayload) {

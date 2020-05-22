@@ -20,7 +20,7 @@ func TestProto1BatchInsert(t *testing.T) {
 	query := "INSERT INTO large (id) VALUES (?)"
 	fullQuery := strings.Join([]string{begin, query, end}, "\n")
 	args := []interface{}{5}
-	if err := session.Query(fullQuery, args...).Consistency(Quorum).Exec(); err != nil {
+	if err := session.Query(fullQuery, args...).WithConsistency(Quorum).Exec(); err != nil {
 		t.Fatal(err)
 	}
 }

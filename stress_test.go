@@ -1,10 +1,7 @@
-// +build all cassandra
-
 package gocql
 
 import (
 	"sync/atomic"
-
 	"testing"
 )
 

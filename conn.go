@@ -1247,21 +1247,20 @@ func (c *Conn) executeBatch(ctx context.Context, batch *Batch) *Iter {
 		return &Iter{err: ErrUnsupported}
 	}
 
-	n := len(batch.Entries)
+	n := len(batch.entries)
 	req := &writeBatchFrame{
-		typ:                   batch.Type,
+		typ:                   batch.typ,
 		statements:            make([]batchStatment, n),
-		consistency:           batch.Cons,
+		consistency:           batch.cons,
 		serialConsistency:     batch.serialCons,
 		defaultTimestamp:      batch.defaultTimestamp,
 		defaultTimestampValue: batch.defaultTimestampValue,
 		customPayload:         batch.CustomPayload,
 	}
 
-	stmts := make(map[string]string, len(batch.Entries))
+	stmts := make(map[string]string, n)
 
-	for i := 0; i < n; i++ {
-		entry := &batch.Entries[i]
+	for i, entry := range batch.entries {
 		b := &req.statements[i]
 
 		if len(entry.Args) > 0 || entry.binding != nil {
@@ -1344,7 +1343,7 @@ func (c *Conn) executeBatch(ctx context.Context, batch *Batch) *Iter {
 }
 
 func (c *Conn) query(ctx context.Context, statement string, values ...interface{}) (iter *Iter) {
-	q := c.session.Query(statement, values...).Consistency(One)
+	q := c.session.Query(statement, values...).WithConsistency(One)
 	q.trace = nil
 	q.skipPrepare = true
 	q.disableSkipMetadata = true

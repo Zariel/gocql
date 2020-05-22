@@ -447,25 +447,10 @@ func (c *controlConn) withConn(fn func(*Conn) *Iter) *Iter {
 }
 
 // query will return nil if the connection is closed or nil
-func (c *controlConn) query(statement string, values ...interface{}) (iter *Iter) {
-	q := c.session.Query(statement, values...).Consistency(One).RoutingKey([]byte{}).Trace(nil)
+func (c *controlConn) query(statement string, values ...interface{}) *Iter {
+	q := c.session.Query(statement, values...).WithConsistency(One).WithRoutingKey([]byte{}).WithTrace(nil).withContext(context.TODO())
 
-	for {
-		iter = c.withConn(func(conn *Conn) *Iter {
-			return conn.executeQuery(context.TODO(), q)
-		})
-
-		if gocqlDebug && iter.err != nil {
-			Logger.Printf("control: error executing %q: %v\n", statement, iter.err)
-		}
-
-		q.AddAttempts(1, c.getConn().host)
-		if iter.err == nil || !c.retry.Attempt(q) {
-			break
-		}
-	}
-
-	return
+	return c.session.executeQuery(q)
 }
 
 func (c *controlConn) awaitSchemaAgreement() error {

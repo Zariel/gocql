@@ -91,14 +91,14 @@ func TestPlacementStrategy_NetworkStrategy(t *testing.T) {
 	sort.Sort(&tokenRing{tokens: tokens})
 
 	strats := []*networkTopology{
-		&networkTopology{
+		{
 			dcs: map[string]int{
 				"dc1": 1,
 				"dc2": 2,
 				"dc3": 3,
 			},
 		},
-		&networkTopology{
+		{
 			dcs: map[string]int{
 				"dc2": 2,
 				"dc3": 3,
