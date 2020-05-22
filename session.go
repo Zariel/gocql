@@ -698,7 +698,7 @@ func (s *Session) MapExecuteBatchCAS(batch *Batch, dest map[string]interface{}) 
 type hostMetrics struct {
 	// Attempts is count of how many times this query has been attempted for this host.
 	// An attempt is either a retry or fetching next page of results.
-	Attempts     int
+	Attempts int
 
 	// TotalLatency is the sum of attempt latencies for this host in nanoseconds.
 	TotalLatency int64
@@ -735,6 +735,10 @@ func (qm *queryMetrics) hostMetrics(host *HostInfo) *hostMetrics {
 // hostMetricsLocked gets or creates host metrics for given host.
 // It must be called only while holding qm.l lock.
 func (qm *queryMetrics) hostMetricsLocked(host *HostInfo) *hostMetrics {
+	if qm.m == nil {
+		qm.m = make(map[string]*hostMetrics, 1)
+	}
+
 	metrics, exists := qm.m[host.ConnectAddress().String()]
 	if !exists {
 		// if the host is not in the map, it means it's been accessed for the first time
@@ -816,7 +820,6 @@ type Query struct {
 	context               context.Context
 	idempotent            bool
 	customPayload         map[string][]byte
-	metrics               *queryMetrics
 
 	disableAutoPage bool
 
@@ -841,7 +844,6 @@ func (q *Query) defaultsFromSession() {
 	q.serialCons = s.cfg.SerialConsistency
 	q.defaultTimestamp = s.cfg.DefaultTimestamp
 	q.idempotent = s.cfg.DefaultIdempotence
-	q.metrics = &queryMetrics{m: make(map[string]*hostMetrics)}
 
 	q.spec = &NonSpeculativeExecution{}
 	s.mu.RUnlock()
@@ -855,24 +857,6 @@ func (q Query) Statement() string {
 // String implements the stringer interface.
 func (q Query) String() string {
 	return fmt.Sprintf("[query statement=%q values=%+v consistency=%s]", q.stmt, q.values, q.cons)
-}
-
-//Attempts returns the number of times the query was executed.
-func (q *Query) Attempts() int {
-	return q.metrics.attempts()
-}
-
-func (q *Query) AddAttempts(i int, host *HostInfo) {
-	q.metrics.attempt(i, 0, host, false)
-}
-
-//Latency returns the average amount of nanoseconds per attempt of the query.
-func (q *Query) Latency() int64 {
-	return q.metrics.latency()
-}
-
-func (q *Query) AddLatency(l int64, host *HostInfo) {
-	q.metrics.attempt(0, time.Duration(l) * time.Nanosecond, host, false)
 }
 
 // Consistency sets the consistency level for this query. If no consistency
@@ -981,25 +965,6 @@ func (q *Query) execute(ctx context.Context, conn *Conn) *Iter {
 	return conn.executeQuery(ctx, q)
 }
 
-func (q *Query) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
-	latency := end.Sub(start)
-	attempt, metricsForHost := q.metrics.attempt(1, latency, host, q.observer != nil)
-
-	if q.observer != nil {
-		q.observer.ObserveQuery(q.Context(), ObservedQuery{
-			Keyspace:  keyspace,
-			Statement: q.stmt,
-			Start:     start,
-			End:       end,
-			Rows:      iter.numRows,
-			Host:      host,
-			Metrics:   metricsForHost,
-			Err:       iter.err,
-			Attempt:   attempt,
-		})
-	}
-}
-
 func (q *Query) retryPolicy() RetryPolicy {
 	return q.rt
 }
@@ -1043,7 +1008,6 @@ func (q *Query) GetRoutingKey() ([]byte, error) {
 }
 
 func (q *Query) shouldPrepare() bool {
-
 	stmt := strings.TrimLeftFunc(strings.TrimRightFunc(q.stmt, func(r rune) bool {
 		return unicode.IsSpace(r) || r == ';'
 	}), unicode.IsSpace)
@@ -1254,8 +1218,30 @@ type Iter struct {
 	next    *nextIter
 	host    *HostInfo
 
+	q       ExecutableQuery
+	metrics queryMetrics
+
 	framer *framer
 	closed int32
+}
+
+func (iter *Iter) attempt(keyspace string, end, start time.Time) {
+	latency := end.Sub(start)
+	attempt, metricsForHost := iter.metrics.attempt(1, latency, iter.host, q.observer != nil)
+
+	if q.observer != nil {
+		q.observer.ObserveQuery(q.Context(), ObservedQuery{
+			Keyspace:  keyspace,
+			Statement: q.stmt,
+			Start:     start,
+			End:       end,
+			Rows:      iter.numRows,
+			Host:      host,
+			Metrics:   metricsForHost,
+			Err:       iter.err,
+			Attempt:   attempt,
+		})
+	}
 }
 
 // Host returns the host which the query was sent to.
@@ -1592,7 +1578,7 @@ func (b *Batch) Latency() int64 {
 }
 
 func (b *Batch) AddLatency(l int64, host *HostInfo) {
-	b.metrics.attempt(0, time.Duration(l) * time.Nanosecond, host, false)
+	b.metrics.attempt(0, time.Duration(l)*time.Nanosecond, host, false)
 }
 
 // GetConsistency returns the currently configured consistency level for the batch
