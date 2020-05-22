@@ -7,7 +7,7 @@ import (
 
 type ExecutableQuery interface {
 	execute(ctx context.Context, conn *Conn) *Iter
-	attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo)
+	observe(stats queryExecutionStats)
 	retryPolicy() RetryPolicy
 	speculativeExecutionPolicy() SpeculativeExecutionPolicy
 	GetRoutingKey() ([]byte, error)
@@ -29,7 +29,7 @@ func (q *queryExecutor) attemptQuery(ctx context.Context, qry ExecutableQuery, c
 	iter := qry.execute(ctx, conn)
 	end := time.Now()
 
-	qry.attempt(q.pool.keyspace, end, start, iter, conn.host)
+	iter.attempt(end, start)
 
 	return iter
 }

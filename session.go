@@ -715,7 +715,7 @@ type queryMetrics struct {
 // preFilledQueryMetrics initializes new queryMetrics based on per-host supplied data.
 func preFilledQueryMetrics(m map[string]*hostMetrics) *queryMetrics {
 	qm := &queryMetrics{m: m}
-	for _, hm := range qm.m {
+	for _, hm := range m {
 		qm.totalAttempts += hm.Attempts
 	}
 	return qm
@@ -776,9 +776,7 @@ func (qm *queryMetrics) latency() int64 {
 
 // attempt adds given number of attempts and latency for given host.
 // It returns previous total attempts.
-// If needsHostMetrics is true, a copy of updated hostMetrics is returned.
-func (qm *queryMetrics) attempt(addAttempts int, addLatency time.Duration,
-	host *HostInfo, needsHostMetrics bool) (int, *hostMetrics) {
+func (qm *queryMetrics) attempt(addAttempts int, addLatency time.Duration, host *HostInfo) (int, *hostMetrics) {
 	qm.l.Lock()
 
 	totalAttempts := qm.totalAttempts
@@ -788,11 +786,8 @@ func (qm *queryMetrics) attempt(addAttempts int, addLatency time.Duration,
 	updateHostMetrics.Attempts += addAttempts
 	updateHostMetrics.TotalLatency += addLatency.Nanoseconds()
 
-	var hostMetricsCopy *hostMetrics
-	if needsHostMetrics {
-		hostMetricsCopy = new(hostMetrics)
-		*hostMetricsCopy = *updateHostMetrics
-	}
+	hostMetricsCopy := new(hostMetrics)
+	*hostMetricsCopy = *updateHostMetrics
 
 	qm.l.Unlock()
 	return totalAttempts, hostMetricsCopy
@@ -1028,6 +1023,23 @@ func (q *Query) shouldPrepare() bool {
 	return false
 }
 
+func (q *Query) observe(stats queryExecutionStats) {
+	if q.observer != nil {
+		o := ObservedQuery{
+			Keyspace:  q.getKeyspace(),
+			Attempt:   stats.attmpt,
+			End:       stats.end,
+			Start:     stats.start,
+			Err:       stats.err,
+			Host:      stats.host,
+			Metrics:   stats.metrics,
+			Rows:      stats.rows,
+			Statement: q.stmt,
+		}
+		q.observer.ObserveQuery(q.Context(), o)
+	}
+}
+
 // SetPrefetch sets the default threshold for pre-fetching new pages. If
 // there are only p*pageSize rows remaining, the next page will be requested
 // automatically.
@@ -1225,23 +1237,30 @@ type Iter struct {
 	closed int32
 }
 
-func (iter *Iter) attempt(keyspace string, end, start time.Time) {
-	latency := end.Sub(start)
-	attempt, metricsForHost := iter.metrics.attempt(1, latency, iter.host, q.observer != nil)
+type queryExecutionStats struct {
+	start, end time.Time
+	rows       int
+	metrics    *hostMetrics
+	attmpt     int
+	err        error
+	host       *HostInfo
+}
 
-	if q.observer != nil {
-		q.observer.ObserveQuery(q.Context(), ObservedQuery{
-			Keyspace:  keyspace,
-			Statement: q.stmt,
-			Start:     start,
-			End:       end,
-			Rows:      iter.numRows,
-			Host:      host,
-			Metrics:   metricsForHost,
-			Err:       iter.err,
-			Attempt:   attempt,
-		})
+func (iter *Iter) attempt(end, start time.Time) {
+	latency := end.Sub(start)
+	attempt, metrics := iter.metrics.attempt(1, latency, iter.host)
+
+	stats := queryExecutionStats{
+		start:   start,
+		end:     end,
+		rows:    iter.numRows,
+		host:    iter.host,
+		metrics: metrics,
+		err:     iter.err,
+		attmpt:  attempt,
 	}
+
+	iter.q.observe(stats)
 }
 
 // Host returns the host which the query was sent to.
@@ -1529,7 +1548,6 @@ type Batch struct {
 	context               context.Context
 	cancelBatch           func()
 	keyspace              string
-	metrics               *queryMetrics
 }
 
 // NewBatch creates a new batch operation using defaults defined in the cluster
@@ -1544,7 +1562,6 @@ func (s *Session) NewBatch(typ BatchType) *Batch {
 		Cons:             s.cons,
 		defaultTimestamp: s.cfg.DefaultTimestamp,
 		keyspace:         s.cfg.Keyspace,
-		metrics:          &queryMetrics{m: make(map[string]*hostMetrics)},
 		spec:             &NonSpeculativeExecution{},
 	}
 
@@ -1561,24 +1578,6 @@ func (b *Batch) Observer(observer BatchObserver) *Batch {
 
 func (b *Batch) Keyspace() string {
 	return b.keyspace
-}
-
-// Attempts returns the number of attempts made to execute the batch.
-func (b *Batch) Attempts() int {
-	return b.metrics.attempts()
-}
-
-func (b *Batch) AddAttempts(i int, host *HostInfo) {
-	b.metrics.attempt(i, 0, host, false)
-}
-
-//Latency returns the average number of nanoseconds to execute a single attempt of the batch.
-func (b *Batch) Latency() int64 {
-	return b.metrics.latency()
-}
-
-func (b *Batch) AddLatency(l int64, host *HostInfo) {
-	b.metrics.attempt(0, time.Duration(l)*time.Nanosecond, host, false)
 }
 
 // GetConsistency returns the currently configured consistency level for the batch
@@ -1696,29 +1695,24 @@ func (b *Batch) WithTimestamp(timestamp int64) *Batch {
 	return b
 }
 
-func (b *Batch) attempt(keyspace string, end, start time.Time, iter *Iter, host *HostInfo) {
-	latency := end.Sub(start)
-	_, metricsForHost := b.metrics.attempt(1, latency, host, b.observer != nil)
+func (b *Batch) observe(stats queryExecutionStats) {
+	if b.observer != nil {
+		statements := make([]string, len(b.Entries))
+		for i, entry := range b.Entries {
+			statements[i] = entry.Stmt
+		}
 
-	if b.observer == nil {
-		return
+		b.observer.ObserveBatch(b.Context(), ObservedBatch{
+			Keyspace:   b.Keyspace(),
+			Statements: statements,
+			Start:      stats.start,
+			End:        stats.end,
+			// Rows not used in batch observations // TODO - might be able to support it when using BatchCAS
+			Host:    stats.host,
+			Metrics: stats.metrics,
+			Err:     stats.err,
+		})
 	}
-
-	statements := make([]string, len(b.Entries))
-	for i, entry := range b.Entries {
-		statements[i] = entry.Stmt
-	}
-
-	b.observer.ObserveBatch(b.Context(), ObservedBatch{
-		Keyspace:   keyspace,
-		Statements: statements,
-		Start:      start,
-		End:        end,
-		// Rows not used in batch observations // TODO - might be able to support it when using BatchCAS
-		Host:    host,
-		Metrics: metricsForHost,
-		Err:     iter.err,
-	})
 }
 
 func (b *Batch) GetRoutingKey() ([]byte, error) {
